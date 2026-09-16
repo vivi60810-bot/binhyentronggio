@@ -767,27 +767,52 @@ export const getStoredCustomChapters = (storyId: string): Chapter[] => {
     const raw = localStorage.getItem(`mel_chapters_${storyId}`);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed;
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+    const aliasId = storyId === 'anh-dao-nam-centimet' ? 'anh-dao-5cm' : storyId === 'anh-dao-5cm' ? 'anh-dao-nam-centimet' : null;
+    if (aliasId) {
+      const rawAlias = localStorage.getItem(`mel_chapters_${aliasId}`);
+      if (rawAlias) {
+        const parsedAlias = JSON.parse(rawAlias);
+        if (Array.isArray(parsedAlias) && parsedAlias.length > 0) return parsedAlias;
+      }
     }
   } catch {}
   return [];
 };
 
 /**
- * Save a custom chapter into localStorage.
+ * Save a custom chapter into localStorage without losing existing chapters.
  */
 export const saveCustomChapterToStorage = (chapter: Chapter): void => {
   try {
-    const list = getStoredCustomChapters(chapter.storyId);
-    const existingIndex = list.findIndex((c) => c.id === chapter.id || c.chapterNumber === chapter.chapterNumber);
+    const existingChapters = getStoryChapters(chapter.storyId);
+    const list = existingChapters.length > 0 ? [...existingChapters] : getStoredCustomChapters(chapter.storyId);
+    const targetPartType = chapter.partType || (chapter.isExtra ? 'extra' : 'main');
+    const existingIndex = list.findIndex(
+      (c) => c.id === chapter.id || (c.chapterNumber === chapter.chapterNumber && (c.partType || (c.isExtra ? 'extra' : 'main')) === targetPartType)
+    );
     if (existingIndex >= 0) {
       list[existingIndex] = chapter;
     } else {
       list.push(chapter);
     }
     // Sort by chapterNumber ascending
-    list.sort((a, b) => a.chapterNumber - b.chapterNumber);
+    list.sort((a, b) => {
+      const numA = Number(a.chapterNumber) || 0;
+      const numB = Number(b.chapterNumber) || 0;
+      if (numA !== numB) return numA - numB;
+      const isExtraA = a.isExtra || a.partType === 'extra' ? 1 : 0;
+      const isExtraB = b.isExtra || b.partType === 'extra' ? 1 : 0;
+      return isExtraA - isExtraB;
+    });
     localStorage.setItem(`mel_chapters_${chapter.storyId}`, JSON.stringify(list));
+    setLiveStoryChapters(chapter.storyId, list);
+    const aliasId = chapter.storyId === 'anh-dao-nam-centimet' ? 'anh-dao-5cm' : chapter.storyId === 'anh-dao-5cm' ? 'anh-dao-nam-centimet' : null;
+    if (aliasId) {
+      localStorage.setItem(`mel_chapters_${aliasId}`, JSON.stringify(list));
+      setLiveStoryChapters(aliasId, list);
+    }
   } catch {}
 };
 
@@ -799,6 +824,7 @@ export const deleteCustomChapterFromStorage = (storyId: string, chapterId: strin
     const list = getStoredCustomChapters(storyId);
     const filtered = list.filter((c) => c.id !== chapterId);
     localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(filtered));
+    setLiveStoryChapters(storyId, filtered);
   } catch {}
 };
 
@@ -813,6 +839,10 @@ export const setLiveChaptersRuntimeCache = (cache: Record<string, Chapter[]>): v
 
 export const setLiveStoryChapters = (storyId: string, chapters: Chapter[]): void => {
   liveChaptersRuntimeCache[storyId] = chapters;
+  const aliasId = storyId === 'anh-dao-nam-centimet' ? 'anh-dao-5cm' : storyId === 'anh-dao-5cm' ? 'anh-dao-nam-centimet' : null;
+  if (aliasId) {
+    liveChaptersRuntimeCache[aliasId] = chapters;
+  }
 };
 
 export const getLiveChaptersRuntimeCache = (): Record<string, Chapter[]> => {
@@ -820,18 +850,32 @@ export const getLiveChaptersRuntimeCache = (): Record<string, Chapter[]> => {
 };
 
 export const getStoryChapters = (storyId: string): Chapter[] => {
-  // 1. Prioritize live real-time chapters from server/runtime synchronized cache
-  if (liveChaptersRuntimeCache[storyId] !== undefined) {
+  const aliasId = storyId === 'anh-dao-nam-centimet' ? 'anh-dao-5cm' : storyId === 'anh-dao-5cm' ? 'anh-dao-nam-centimet' : null;
+
+  // 1. Prioritize live real-time chapters from runtime synchronized cache if non-empty
+  if (liveChaptersRuntimeCache[storyId] !== undefined && liveChaptersRuntimeCache[storyId].length > 0) {
     return liveChaptersRuntimeCache[storyId];
   }
+  if (aliasId && liveChaptersRuntimeCache[aliasId] !== undefined && liveChaptersRuntimeCache[aliasId].length > 0) {
+    return liveChaptersRuntimeCache[aliasId];
+  }
 
-  // 2. Retrieve custom author-published chapters from local storage if saved
+  // 2. Retrieve custom author-published chapters from local storage if saved and non-empty
   try {
     const raw = localStorage.getItem(`mel_chapters_${storyId}`);
     if (raw !== null) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
+      if (Array.isArray(parsed) && parsed.length > 0) {
         return parsed;
+      }
+    }
+    if (aliasId) {
+      const rawAlias = localStorage.getItem(`mel_chapters_${aliasId}`);
+      if (rawAlias !== null) {
+        const parsedAlias = JSON.parse(rawAlias);
+        if (Array.isArray(parsedAlias) && parsedAlias.length > 0) {
+          return parsedAlias;
+        }
       }
     }
   } catch {}
@@ -839,13 +883,15 @@ export const getStoryChapters = (storyId: string): Chapter[] => {
   // 3. Retrieve base sample chapters only for predefined seed stories if not yet initialized
   if (SAMPLE_CHAPTERS[storyId] && SAMPLE_CHAPTERS[storyId].length > 0) {
     return SAMPLE_CHAPTERS[storyId];
-  } else if (storyId === 'anh-dao-nam-centimet' && SAMPLE_CHAPTERS['anh-dao-5cm']) {
-    return SAMPLE_CHAPTERS['anh-dao-5cm'];
-  } else if (storyId === 'anh-dao-5cm' && SAMPLE_CHAPTERS['anh-dao-nam-centimet']) {
-    return SAMPLE_CHAPTERS['anh-dao-nam-centimet'];
+  } else if (aliasId && SAMPLE_CHAPTERS[aliasId] && SAMPLE_CHAPTERS[aliasId].length > 0) {
+    return SAMPLE_CHAPTERS[aliasId];
   }
 
-  // Any newly created user story starts strictly with empty chapters until published
+  // 4. Return runtime cache if present (even if empty, for completely new empty stories)
+  if (liveChaptersRuntimeCache[storyId] !== undefined) {
+    return liveChaptersRuntimeCache[storyId];
+  }
+
   return [];
 };
 

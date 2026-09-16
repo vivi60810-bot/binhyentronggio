@@ -66,9 +66,19 @@ export const StoryModal: React.FC<StoryModalProps> = ({
   // Real-time synchronization of chapters for this story
   useEffect(() => {
     if (!story || !isOpen) return;
-    setLiveChapters(getStoryChapters(story.id));
+    const initial = getStoryChapters(story.id);
+    if (initial.length > 0) {
+      setLiveChapters(initial);
+    }
     const unsubChapters = subscribeToStoryChapters(story.id, (chs) => {
-      setLiveChapters(chs || []);
+      if (Array.isArray(chs) && chs.length > 0) {
+        setLiveChapters(chs);
+      } else {
+        const fallback = getStoryChapters(story.id);
+        if (fallback.length > 0) {
+          setLiveChapters(fallback);
+        }
+      }
     });
     return () => unsubChapters();
   }, [story?.id, isOpen]);

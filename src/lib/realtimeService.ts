@@ -59,6 +59,37 @@ export const sanitizeForFirestore = <T>(data: T): T => {
   return data;
 };
 
+/**
+ * Safely merges two lists of chapters, deduplicating by ID or chapterNumber + partType,
+ * ensuring author edits and newly published chapters are preserved.
+ */
+export const mergeChapters = (base: Chapter[], incoming: Chapter[]): Chapter[] => {
+  const map = new Map<string, Chapter>();
+  base.forEach((ch) => {
+    const key = ch.id || `${ch.storyId}-${ch.partType || (ch.isExtra ? 'extra' : 'main')}-${ch.chapterNumber}`;
+    map.set(key, ch);
+  });
+  incoming.forEach((ch) => {
+    const key = ch.id || `${ch.storyId}-${ch.partType || (ch.isExtra ? 'extra' : 'main')}-${ch.chapterNumber}`;
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, ch);
+    } else {
+      map.set(key, { ...existing, ...ch });
+    }
+  });
+  const result = Array.from(map.values());
+  result.sort((a, b) => {
+    const numA = Number(a.chapterNumber) || 0;
+    const numB = Number(b.chapterNumber) || 0;
+    if (numA !== numB) return numA - numB;
+    const isExtraA = a.isExtra || a.partType === 'extra' ? 1 : 0;
+    const isExtraB = b.isExtra || b.partType === 'extra' ? 1 : 0;
+    return isExtraA - isExtraB;
+  });
+  return result;
+};
+
 // Active memory listeners for instant UI synchronization
 const activeStorySubscribers = new Set<(stories: Story[]) => void>();
 const activeAnnouncementSubscribers = new Set<(announcements: Announcement[]) => void>();
@@ -169,13 +200,14 @@ export const initServerRealtimeSync = () => {
         }
         if (data.chapters && typeof data.chapters === 'object') {
           for (const [sId, list] of Object.entries(data.chapters as Record<string, Chapter[]>)) {
-            const currentList = getStoryChapters(sId);
-            if (currentList.length === 0 && Array.isArray(list) && list.length > 0) {
+            if (Array.isArray(list) && list.length > 0) {
+              const currentList = getStoryChapters(sId);
+              const merged = mergeChapters(currentList, list);
               try {
-                localStorage.setItem(`mel_chapters_${sId}`, JSON.stringify(list));
+                localStorage.setItem(`mel_chapters_${sId}`, JSON.stringify(merged));
               } catch {}
-              setLiveStoryChapters(sId, list);
-              notifyChapterSubscribers(sId, list);
+              setLiveStoryChapters(sId, merged);
+              notifyChapterSubscribers(sId, merged);
             }
           }
           activeAllChaptersSubscribers.forEach((cb) => {
@@ -1892,19 +1924,34 @@ export const subscribeToAllChapters = (
           }
         });
 
-        // Ensure EVERY known story is represented (including baseline sample chapters)
+        // Link aliases
+        if (grouped['anh-dao-5cm'] && !grouped['anh-dao-nam-centimet']) {
+          grouped['anh-dao-nam-centimet'] = grouped['anh-dao-5cm'];
+        } else if (grouped['anh-dao-nam-centimet'] && !grouped['anh-dao-5cm']) {
+          grouped['anh-dao-5cm'] = grouped['anh-dao-nam-centimet'];
+        }
+
+        // Ensure EVERY known story is represented (merge with local and sample chapters)
         const currentStories = getStoredStories();
         currentStories.forEach((s) => {
+          const localList = getStoryChapters(s.id);
           if (!grouped[s.id] || grouped[s.id].length === 0) {
-            const samples = SAMPLE_CHAPTERS[s.id] || [];
-            const nonDeletedSamples = samples.filter((c) => !cloudDeletedChapterIds.has(c.id));
-            grouped[s.id] = nonDeletedSamples;
+            grouped[s.id] = localList.length > 0 ? localList : (SAMPLE_CHAPTERS[s.id] || []);
+          } else if (localList.length > 0) {
+            grouped[s.id] = mergeChapters(localList, grouped[s.id]);
           }
         });
 
         // For each story, sort and update
         for (const [sId, chList] of Object.entries(grouped)) {
-          chList.sort((a, b) => (Number(a.chapterNumber) || 0) - (Number(b.chapterNumber) || 0));
+          chList.sort((a, b) => {
+            const numA = Number(a.chapterNumber) || 0;
+            const numB = Number(b.chapterNumber) || 0;
+            if (numA !== numB) return numA - numB;
+            const isExtraA = a.isExtra || a.partType === 'extra' ? 1 : 0;
+            const isExtraB = b.isExtra || b.partType === 'extra' ? 1 : 0;
+            return isExtraA - isExtraB;
+          });
           try {
             localStorage.setItem(`mel_chapters_${sId}`, JSON.stringify(chList));
           } catch {}
@@ -1946,6 +1993,8 @@ export const subscribeToStoryChapters = (
   storyId: string,
   callback: (chapters: Chapter[]) => void
 ): (() => void) => {
+  const aliasId = storyId === 'anh-dao-nam-centimet' ? 'anh-dao-5cm' : storyId === 'anh-dao-5cm' ? 'anh-dao-nam-centimet' : null;
+
   // 1. Provide combined local chapters immediately
   const initial = getStoryChapters(storyId);
   callback(initial);
@@ -1955,6 +2004,12 @@ export const subscribeToStoryChapters = (
     activeChapterSubscribers.set(storyId, new Set());
   }
   activeChapterSubscribers.get(storyId)!.add(callback);
+  if (aliasId) {
+    if (!activeChapterSubscribers.has(aliasId)) {
+      activeChapterSubscribers.set(aliasId, new Set());
+    }
+    activeChapterSubscribers.get(aliasId)!.add(callback);
+  }
 
   // 3. Immediately query Server API for real-time consistency across devices
   if (typeof window !== 'undefined') {
@@ -1963,14 +2018,13 @@ export const subscribeToStoryChapters = (
       .then((serverList) => {
         if (Array.isArray(serverList) && serverList.length > 0) {
           const currentList = getStoryChapters(storyId);
-          if (currentList.length === 0) {
-            setLiveStoryChapters(storyId, serverList);
-            try {
-              localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(serverList));
-            } catch {}
-            callback(serverList);
-            notifyChapterSubscribers(storyId, serverList);
-          }
+          const merged = mergeChapters(currentList, serverList);
+          setLiveStoryChapters(storyId, merged);
+          try {
+            localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(merged));
+          } catch {}
+          callback(merged);
+          notifyChapterSubscribers(storyId, merged);
         }
       })
       .catch(() => {});
@@ -1980,7 +2034,12 @@ export const subscribeToStoryChapters = (
   let unsubFirestore: (() => void) | null = null;
   try {
     const chaptersColl = collection(db, 'chapter_stats');
-    const q = query(chaptersColl, where('storyId', '==', storyId));
+    const queryIds = [storyId];
+    if (aliasId) queryIds.push(aliasId);
+
+    const q = queryIds.length > 1
+      ? query(chaptersColl, where('storyId', 'in', queryIds))
+      : query(chaptersColl, where('storyId', '==', storyId));
 
     unsubFirestore = onSnapshot(
       q,
@@ -1996,26 +2055,42 @@ export const subscribeToStoryChapters = (
           }
         } catch {}
 
-        const list: Chapter[] = [];
+        const cloudChapters: Chapter[] = [];
         snapshot.forEach((d) => {
           const ch = { ...(d.data() as any), id: d.id };
           if (!ch.deleted && !cloudDeletedChapterIds.has(ch.id)) {
-            list.push(ch);
+            cloudChapters.push(ch);
           }
         });
 
-        if (list.length === 0 && SAMPLE_CHAPTERS[storyId]) {
-          const samples = SAMPLE_CHAPTERS[storyId].filter((c) => !cloudDeletedChapterIds.has(c.id));
-          samples.forEach((c) => list.push(c));
+        const currentLocal = getStoryChapters(storyId);
+        let finalChapters: Chapter[] = [];
+
+        if (cloudChapters.length > 0) {
+          finalChapters = mergeChapters(currentLocal, cloudChapters);
+        } else {
+          // If Firestore returns 0 documents, DO NOT wipe existing chapters!
+          finalChapters = currentLocal.length > 0 ? currentLocal : (SAMPLE_CHAPTERS[storyId] || (aliasId ? SAMPLE_CHAPTERS[aliasId] : []) || []);
         }
 
-        list.sort((a, b) => (Number(a.chapterNumber) || 0) - (Number(b.chapterNumber) || 0));
-        try {
-          localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(list));
-        } catch {}
-        setLiveStoryChapters(storyId, list);
-        callback(list);
-        notifyChapterSubscribers(storyId, list);
+        finalChapters.sort((a, b) => {
+          const numA = Number(a.chapterNumber) || 0;
+          const numB = Number(b.chapterNumber) || 0;
+          if (numA !== numB) return numA - numB;
+          const isExtraA = a.isExtra || a.partType === 'extra' ? 1 : 0;
+          const isExtraB = b.isExtra || b.partType === 'extra' ? 1 : 0;
+          return isExtraA - isExtraB;
+        });
+
+        if (finalChapters.length > 0) {
+          try {
+            localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(finalChapters));
+            if (aliasId) localStorage.setItem(`mel_chapters_${aliasId}`, JSON.stringify(finalChapters));
+          } catch {}
+          setLiveStoryChapters(storyId, finalChapters);
+          callback(finalChapters);
+          notifyChapterSubscribers(storyId, finalChapters);
+        }
       },
       (err) => {
         console.warn(`chapter_stats snapshot error for ${storyId}:`, err);
@@ -2026,8 +2101,8 @@ export const subscribeToStoryChapters = (
   }
 
   return () => {
-    const set = activeChapterSubscribers.get(storyId);
-    if (set) set.delete(callback);
+    activeChapterSubscribers.get(storyId)?.delete(callback);
+    if (aliasId) activeChapterSubscribers.get(aliasId)?.delete(callback);
     if (unsubFirestore) unsubFirestore();
   };
 };
@@ -2054,13 +2129,20 @@ export const publishChapter = async (chapter: Chapter): Promise<void> => {
     partType: chapter.partType || (chapter.isExtra ? 'extra' : 'main'),
   };
 
-  // 2. Save chapter to localStorage
+  // 2. Save chapter to localStorage without losing existing chapters
   saveCustomChapterToStorage(cleanChapter);
 
   // 3. Update memory cache and notify chapter listeners immediately
   const allChapters = getStoryChapters(cleanChapter.storyId);
   setLiveStoryChapters(cleanChapter.storyId, allChapters);
   notifyChapterSubscribers(cleanChapter.storyId, allChapters);
+
+  const aliasId = cleanChapter.storyId === 'anh-dao-nam-centimet' ? 'anh-dao-5cm' : cleanChapter.storyId === 'anh-dao-5cm' ? 'anh-dao-nam-centimet' : null;
+  if (aliasId) {
+    setLiveStoryChapters(aliasId, allChapters);
+    notifyChapterSubscribers(aliasId, allChapters);
+  }
+
   activeAllChaptersSubscribers.forEach((cb) => {
     try { cb(getLiveChaptersRuntimeCache()); } catch {}
   });
@@ -2068,7 +2150,7 @@ export const publishChapter = async (chapter: Chapter): Promise<void> => {
   // 4. Update story completedChapters count in localStorage
   try {
     const stories = getStoredStories();
-    const target = stories.find((s) => s.id === cleanChapter.storyId);
+    const target = stories.find((s) => s.id === cleanChapter.storyId || (aliasId && s.id === aliasId));
     if (target) {
       target.completedChapters = allChapters.length;
       target.updatedAt = 'Vừa đăng';
@@ -2103,19 +2185,34 @@ export const publishChapter = async (chapter: Chapter): Promise<void> => {
     const chapterStatsRef = doc(db, 'chapter_stats', cleanChapter.id);
     await setDoc(chapterStatsRef, fullChapterData, { merge: true });
 
-    // Unmark in site_stats/deleted_records
+    // Unmark both chapter and story in site_stats/deleted_records
     try {
       const statsDelRef = doc(db, 'site_stats', 'deleted_records');
-      await updateDoc(statsDelRef, { chapterIds: arrayRemove(cleanChapter.id) }).catch(() => {});
+      await updateDoc(statsDelRef, {
+        chapterIds: arrayRemove(cleanChapter.id),
+        storyIds: arrayRemove(cleanChapter.storyId),
+      }).catch(() => {});
     } catch {}
 
-    // Update story_stats completedChapters
+    // Unmark story from local deleted list if present
+    try {
+      const rawDel = localStorage.getItem('mel_deleted_story_ids');
+      if (rawDel) {
+        const delList: string[] = JSON.parse(rawDel);
+        const filtered = delList.filter((id) => id !== cleanChapter.storyId && (!aliasId || id !== aliasId));
+        localStorage.setItem('mel_deleted_story_ids', JSON.stringify(filtered));
+      }
+    } catch {}
+
+    // Update story_stats completedChapters & ensure deleted: false
     const storyStatsRef = doc(db, 'story_stats', cleanChapter.storyId);
     await setDoc(
       storyStatsRef,
       {
+        storyId: cleanChapter.storyId,
         completedChapters: allChapters.length,
         updatedAt: 'Vừa đăng',
+        deleted: false,
       },
       { merge: true }
     );
@@ -2124,7 +2221,7 @@ export const publishChapter = async (chapter: Chapter): Promise<void> => {
     const chapterRef = doc(db, 'chapters', cleanChapter.id);
     await setDoc(chapterRef, fullChapterData, { merge: true }).catch(() => {});
     const storyRef = doc(db, 'stories', cleanChapter.storyId);
-    await setDoc(storyRef, { completedChapters: allChapters.length, updatedAt: 'Vừa đăng' }, { merge: true }).catch(() => {});
+    await setDoc(storyRef, { completedChapters: allChapters.length, updatedAt: 'Vừa đăng', deleted: false }, { merge: true }).catch(() => {});
   } catch (firestoreErr) {
     console.warn('Firestore publish chapter warning:', firestoreErr);
   }

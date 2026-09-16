@@ -25,6 +25,25 @@ import { BackgroundMusicBar } from './components/BackgroundMusicBar';
 import { SakuraPetals } from './components/SakuraPetals';
 import { Clock, Sparkles, CheckCircle2, ArrowLeft, MailOpen, X, ArrowUp, ChevronUp, ChevronDown } from 'lucide-react';
 
+const formatRelativeTime = (timeStr?: string): string => {
+  if (!timeStr) return 'Vừa đăng';
+  if (timeStr.includes('trước') || timeStr === 'Vừa đăng' || timeStr === 'Mới') {
+    return timeStr;
+  }
+  const date = new Date(timeStr);
+  if (isNaN(date.getTime())) return timeStr;
+  const now = Date.now();
+  const diffMs = now - date.getTime();
+  if (diffMs < 0 || diffMs < 60 * 1000) return 'Vừa xong';
+  const diffMins = Math.floor(diffMs / (60 * 1000));
+  if (diffMins < 60) return `${diffMins} phút trước`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours} giờ trước`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 7) return `${diffDays} ngày trước`;
+  return `${date.getDate().toString().padStart(2, '0')}/${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getFullYear()}`;
+};
+
 export default function App() {
   const [currentTab, setCurrentTab] = useState<ActiveTab>('home');
   const [activeLetter, setActiveLetter] = useState<LetterTab | null>(null);
@@ -241,31 +260,47 @@ export default function App() {
   const modalStory = modalStoryId ? stories.find((s) => s.id === modalStoryId) || null : null;
 
   const dynamicRecentUpdates: RecentUpdate[] = useMemo(() => {
-    const list: RecentUpdate[] = [];
+    const allRecentChapters: (RecentUpdate & { rawTime: number })[] = [];
+
     stories.forEach((story) => {
       const chs = getStoryChapters(story.id);
-      if (chs.length > 0) {
-        const latest = chs[chs.length - 1];
-        list.push({
-          id: `upd-${story.id}-${latest.id}`,
+      chs.forEach((ch) => {
+        const timeVal = ch.publishedAt ? new Date(ch.publishedAt).getTime() : 0;
+        allRecentChapters.push({
+          id: `upd-${story.id}-${ch.id}`,
           storyId: story.id,
           storyTitle: story.title,
-          chapterNumber: latest.chapterNumber,
-          chapterTitle: latest.title,
-          timeAgo: story.updatedAt || 'Vừa đăng',
-          isLocked: Boolean(latest.isLocked),
+          chapterNumber: ch.chapterNumber,
+          chapterTitle: ch.title,
+          timeAgo: formatRelativeTime(ch.publishedAt || story.updatedAt),
+          isLocked: Boolean(ch.isLocked),
           status: story.status,
+          rawTime: !isNaN(timeVal) ? timeVal : 0,
         });
-      }
+      });
     });
-    if (list.length > 0) {
-      return list.slice(0, 10);
+
+    if (allRecentChapters.length > 0) {
+      allRecentChapters.sort((a, b) => {
+        if (a.rawTime > 0 && b.rawTime > 0 && a.rawTime !== b.rawTime) {
+          return b.rawTime - a.rawTime;
+        }
+        if (b.rawTime > 0 && a.rawTime === 0) return 1;
+        if (a.rawTime > 0 && b.rawTime === 0) return -1;
+        return b.chapterNumber - a.chapterNumber;
+      });
+      return allRecentChapters.slice(0, 10);
     }
     return RECENT_UPDATES;
   }, [stories, chaptersVersion]);
 
   const readingStory = readingChapterInfo
-    ? stories.find((s) => s.id === readingChapterInfo.storyId) || null
+    ? stories.find(
+        (s) =>
+          s.id === readingChapterInfo.storyId ||
+          (readingChapterInfo.storyId === 'anh-dao-5cm' && s.id === 'anh-dao-nam-centimet') ||
+          (readingChapterInfo.storyId === 'anh-dao-nam-centimet' && s.id === 'anh-dao-5cm')
+      ) || null
     : null;
   const readingChapters = useMemo(() => {
     return readingStory ? getStoryChapters(readingStory.id) : [];

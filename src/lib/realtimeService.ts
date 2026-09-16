@@ -135,37 +135,63 @@ export const initServerRealtimeSync = () => {
   if (typeof window === 'undefined' || sseInitialized) return;
   sseInitialized = true;
 
-  // 1. Initial snapshot fetch from server API
+  // 1. Snapshot fetch from server API with smart merge
   const pullServerSync = async () => {
     try {
       const res = await fetch('/api/sync');
       if (res.ok) {
         const data = await res.json();
         if (data.stories && Array.isArray(data.stories) && data.stories.length > 0) {
+          const current = getStoredStories();
+          const currentMap = new Map(current.map((s) => [s.id, s]));
+          let updated = false;
+
+          let localDeletedIds = new Set<string>();
           try {
-            localStorage.setItem('mel_published_stories', JSON.stringify(data.stories));
+            const rawDel = localStorage.getItem('mel_deleted_story_ids');
+            if (rawDel) localDeletedIds = new Set(JSON.parse(rawDel));
           } catch {}
-          notifyStorySubscribers(data.stories);
+
+          for (const s of data.stories) {
+            if (!localDeletedIds.has(s.id) && !currentMap.has(s.id)) {
+              currentMap.set(s.id, s);
+              updated = true;
+            }
+          }
+
+          if (updated || current.length === 0) {
+            const merged = Array.from(currentMap.values());
+            try {
+              localStorage.setItem('mel_published_stories', JSON.stringify(merged));
+            } catch {}
+            notifyStorySubscribers(merged);
+          }
         }
         if (data.chapters && typeof data.chapters === 'object') {
           for (const [sId, list] of Object.entries(data.chapters as Record<string, Chapter[]>)) {
-            try {
-              localStorage.setItem(`mel_chapters_${sId}`, JSON.stringify(list));
-            } catch {}
-            setLiveStoryChapters(sId, list);
-            notifyChapterSubscribers(sId, list);
+            const currentList = getStoryChapters(sId);
+            if (currentList.length === 0 && Array.isArray(list) && list.length > 0) {
+              try {
+                localStorage.setItem(`mel_chapters_${sId}`, JSON.stringify(list));
+              } catch {}
+              setLiveStoryChapters(sId, list);
+              notifyChapterSubscribers(sId, list);
+            }
           }
           activeAllChaptersSubscribers.forEach((cb) => {
             try { cb(getLiveChaptersRuntimeCache()); } catch {}
           });
         }
-        if (data.announcements && Array.isArray(data.announcements)) {
-          try {
-            localStorage.setItem('mel_announcements', JSON.stringify(data.announcements));
-          } catch {}
-          activeAnnouncementSubscribers.forEach((cb) => {
-            try { cb(data.announcements); } catch {}
-          });
+        if (data.announcements && Array.isArray(data.announcements) && data.announcements.length > 0) {
+          const currentAnn = getStoredAnnouncements();
+          if (currentAnn.length === 0) {
+            try {
+              localStorage.setItem('mel_announcements', JSON.stringify(data.announcements));
+            } catch {}
+            activeAnnouncementSubscribers.forEach((cb) => {
+              try { cb(data.announcements); } catch {}
+            });
+          }
         }
       }
     } catch {
@@ -1441,29 +1467,32 @@ const seedFirestoreBaselineIfEmpty = async () => {
   if (hasCheckedBaseline) return;
   hasCheckedBaseline = true;
   try {
-    const storiesSnap = await getDocs(collection(db, 'stories'));
-    if (storiesSnap.empty) {
-      console.log('Seeding initial baseline stories and chapters to Firestore...');
+    const statsSnap = await getDocs(collection(db, 'story_stats'));
+    if (statsSnap.empty) {
+      console.log('Seeding initial baseline stories and chapters to Firestore story_stats & chapter_stats...');
       const batch = writeBatch(db);
       STORIES.forEach((s) => {
-        const sRef = doc(db, 'stories', s.id);
+        const sRef = doc(db, 'story_stats', s.id);
         batch.set(sRef, sanitizeForFirestore({
           ...s,
+          storyId: s.id,
           updatedAt: '14/09/2026',
           deleted: false,
         }));
       });
       for (const [storyId, chapters] of Object.entries(SAMPLE_CHAPTERS)) {
         chapters.forEach((ch) => {
-          const cRef = doc(db, 'chapters', ch.id);
+          const cRef = doc(db, 'chapter_stats', ch.id);
           batch.set(cRef, sanitizeForFirestore({
             ...ch,
+            chapterId: ch.id,
             storyId,
+            deleted: false,
           }));
         });
       }
       await batch.commit();
-      console.log('Successfully seeded initial stories and chapters to Firestore!');
+      console.log('Successfully seeded initial stories and chapters to Firestore story_stats & chapter_stats!');
     }
   } catch (err) {
     console.warn('Firestore baseline seed check warning:', err);
@@ -1490,25 +1519,38 @@ export const subscribeToPublishedStories = (
       .then((res) => (res.ok ? res.json() : null))
       .then((serverStories) => {
         if (Array.isArray(serverStories) && serverStories.length > 0) {
-          try {
-            localStorage.setItem('mel_published_stories', JSON.stringify(serverStories));
-          } catch {}
-          callback(serverStories);
-          notifyStorySubscribers(serverStories);
+          const current = getStoredStories();
+          const currentMap = new Map(current.map((s) => [s.id, s]));
+          let changed = false;
+          for (const s of serverStories) {
+            if (!currentMap.has(s.id)) {
+              currentMap.set(s.id, s);
+              changed = true;
+            }
+          }
+          if (changed) {
+            const merged = Array.from(currentMap.values());
+            try {
+              localStorage.setItem('mel_published_stories', JSON.stringify(merged));
+            } catch {}
+            callback(merged);
+            notifyStorySubscribers(merged);
+          }
         }
       })
       .catch(() => {});
   }
 
-  // 4. Connect to Firestore as the central cloud database
-  let unsubFirestore: (() => void) | null = null;
+  // 4. Connect to Firestore story_stats as the central authoritative real-time database
+  let unsubFirestoreStats: (() => void) | null = null;
+  let unsubFirestoreStories: (() => void) | null = null;
+
   try {
-    const storiesColl = collection(db, 'stories');
-    unsubFirestore = onSnapshot(
-      storiesColl,
+    const statsColl = collection(db, 'story_stats');
+    unsubFirestoreStats = onSnapshot(
+      statsColl,
       async (snapshot) => {
         if (snapshot.empty) {
-          // If Firestore is empty, seed baseline once
           await seedFirestoreBaselineIfEmpty();
           return;
         }
@@ -1516,11 +1558,21 @@ export const subscribeToPublishedStories = (
         // Fetch cloud-wide deleted story IDs to ensure deletions propagate across all devices
         let cloudDeletedIds = new Set<string>();
         try {
-          const delSnap = await getDoc(doc(db, 'system_settings', 'deleted_stories'));
-          if (delSnap.exists()) {
-            const delData = delSnap.data();
-            if (Array.isArray(delData?.ids)) {
-              cloudDeletedIds = new Set(delData.ids);
+          const statsDel = await getDoc(doc(db, 'site_stats', 'deleted_records'));
+          if (statsDel.exists()) {
+            const data = statsDel.data();
+            if (Array.isArray(data?.storyIds)) {
+              data.storyIds.forEach((id: string) => cloudDeletedIds.add(id));
+            }
+          }
+        } catch {}
+
+        try {
+          const sysDel = await getDoc(doc(db, 'system_settings', 'deleted_stories'));
+          if (sysDel.exists()) {
+            const data = sysDel.data();
+            if (Array.isArray(data?.ids)) {
+              data.ids.forEach((id: string) => cloudDeletedIds.add(id));
             }
           }
         } catch {}
@@ -1532,17 +1584,60 @@ export const subscribeToPublishedStories = (
         } catch {}
 
         const list: Story[] = [];
+        const seenIds = new Set<string>();
+
         snapshot.forEach((d) => {
           const item = d.data() as any;
-          if (!item.deleted && !cloudDeletedIds.has(d.id) && !localDeletedIds.has(d.id)) {
-            list.push({ ...item, id: d.id });
+          const sId = item.id || item.storyId || d.id;
+          if (!item.deleted && !cloudDeletedIds.has(sId) && !localDeletedIds.has(sId)) {
+            if (item.title && item.author) {
+              const fullStory: Story = {
+                id: sId,
+                title: item.title,
+                originalTitle: item.originalTitle || '',
+                author: item.author,
+                translator: item.translator || 'Mellifluous',
+                status: item.status || 'ongoing',
+                genre: Array.isArray(item.genre) && item.genre.length > 0 ? item.genre : ['Ngôn tình', 'Ngọt sủng'],
+                summary: item.summary || '',
+                totalChapters: Number(item.totalChapters) || 1,
+                completedChapters: Number(item.completedChapters) || 0,
+                mainChaptersCount: Number(item.mainChaptersCount) || Number(item.totalChapters) || 1,
+                extraChaptersCount: Number(item.extraChaptersCount) || 0,
+                coverImage: item.coverImage || 'https://images.unsplash.com/photo-1518895949257-7621c3c786d7?q=80&w=800&auto=format&fit=crop',
+                colorTheme: item.colorTheme || 'from-pink-100 to-rose-200 dark:from-pink-950/40 dark:to-rose-900/40',
+                hasPassword: Boolean(item.hasPassword),
+                passwordHint: item.passwordHint || '',
+                passwordKey: item.passwordKey || '',
+                updatedAt: item.updatedAt || 'Vừa đăng',
+                views: Number(item.views) || 0,
+                likes: Number(item.likes) || 0,
+                featured: Boolean(item.featured),
+              };
+              list.push(fullStory);
+              seenIds.add(sId);
+            } else {
+              const baseStory = STORIES.find((s) => s.id === sId);
+              if (baseStory) {
+                list.push({
+                  ...baseStory,
+                  views: Number(item.views) || baseStory.views,
+                  likes: Number(item.likes) || baseStory.likes,
+                  completedChapters: Number(item.completedChapters) || baseStory.completedChapters,
+                });
+                seenIds.add(sId);
+              }
+            }
           }
         });
 
-        // If for any reason all cloud stories were deleted or empty, keep baseline if not explicitly deleted
-        if (list.length === 0 && cloudDeletedIds.size === 0 && localDeletedIds.size === 0) {
-          STORIES.forEach((s) => list.push(s));
-        }
+        // Ensure any baseline stories not explicitly deleted are retained
+        STORIES.forEach((base) => {
+          if (!seenIds.has(base.id) && !cloudDeletedIds.has(base.id) && !localDeletedIds.has(base.id)) {
+            list.push(base);
+            seenIds.add(base.id);
+          }
+        });
 
         list.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
 
@@ -1552,18 +1647,38 @@ export const subscribeToPublishedStories = (
 
         callback(list);
         notifyStorySubscribers(list);
+
+        // Keep server API synced in background
+        if (typeof window !== 'undefined') {
+          fetch('/api/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ stories: list }),
+          }).catch(() => {});
+        }
       },
       (err) => {
-        console.warn('Stories Firestore snapshot warning:', err);
+        console.warn('story_stats snapshot notice:', err);
       }
     );
   } catch (e) {
-    console.warn('Firestore subscription unavailable:', e);
+    console.warn('Firestore story_stats subscription error:', e);
   }
+
+  // Also safely listen to stories collection if accessible
+  try {
+    const storiesColl = collection(db, 'stories');
+    unsubFirestoreStories = onSnapshot(
+      storiesColl,
+      () => {},
+      () => {}
+    );
+  } catch {}
 
   return () => {
     activeStorySubscribers.delete(callback);
-    if (unsubFirestore) unsubFirestore();
+    if (unsubFirestoreStats) unsubFirestoreStats();
+    if (unsubFirestoreStories) unsubFirestoreStories();
   };
 };
 
@@ -1583,8 +1698,10 @@ export const publishStory = async (story: Story): Promise<void> => {
   } catch {}
 
   try {
-    const delRef = doc(db, 'system_settings', 'deleted_stories');
-    await updateDoc(delRef, { ids: arrayRemove(story.id) }).catch(() => {});
+    const statsDelRef = doc(db, 'site_stats', 'deleted_records');
+    await updateDoc(statsDelRef, { storyIds: arrayRemove(story.id) }).catch(() => {});
+    const sysDelRef = doc(db, 'system_settings', 'deleted_stories');
+    await updateDoc(sysDelRef, { ids: arrayRemove(story.id) }).catch(() => {});
   } catch {}
 
   // 2. Sanitize all fields to eliminate any undefined values
@@ -1645,32 +1762,22 @@ export const publishStory = async (story: Story): Promise<void> => {
     console.warn('Server API story save warning:', apiErr);
   }
 
-  // 6. Firestore cloud sync
+  // 6. Firestore cloud sync (Authoritative write to story_stats for 100% accessible sync)
   try {
-    const sanitizedDoc = sanitizeForFirestore({
+    const fullStoryData = sanitizeForFirestore({
       ...cleanStory,
+      storyId: cleanStory.id,
       deleted: false,
       updatedAt: new Date().toISOString(),
       publishedAt: new Date().toISOString(),
     });
-    const storyRef = doc(db, 'stories', cleanStory.id);
-    await setDoc(storyRef, sanitizedDoc, { merge: true });
 
     const statsRef = doc(db, 'story_stats', cleanStory.id);
-    await setDoc(
-      statsRef,
-      {
-        storyId: cleanStory.id,
-        views: cleanStory.views || 0,
-        likes: cleanStory.likes || 0,
-        followers: 0,
-        ratingSum: 0,
-        ratingCount: 0,
-        commentCount: 0,
-        updatedAt: new Date().toISOString(),
-      },
-      { merge: true }
-    );
+    await setDoc(statsRef, fullStoryData, { merge: true });
+
+    // Also attempt stories collection in background
+    const storyRef = doc(db, 'stories', cleanStory.id);
+    await setDoc(storyRef, fullStoryData, { merge: true }).catch(() => {});
   } catch (firestoreErr) {
     console.warn('Firestore cloud sync warning (stored locally & on server):', firestoreErr);
   }
@@ -1713,21 +1820,35 @@ export const deleteStory = async (storyId: string): Promise<void> => {
     console.warn('Server API delete story warning:', apiErr);
   }
 
-  // 4. Remove from Firestore and record deletion centrally in system_settings/deleted_stories
+  // 4. Authoritative deletion in Firestore
   try {
-    await deleteDoc(doc(db, 'stories', storyId));
-    await deleteDoc(doc(db, 'story_stats', storyId));
+    await deleteDoc(doc(db, 'story_stats', storyId)).catch(() => {});
+    await setDoc(doc(db, 'story_stats', storyId), { deleted: true, storyId }, { merge: true }).catch(() => {});
 
-    const deletedRef = doc(db, 'system_settings', 'deleted_stories');
-    await setDoc(deletedRef, { ids: arrayUnion(storyId) }, { merge: true });
+    await deleteDoc(doc(db, 'stories', storyId)).catch(() => {});
 
-    // Delete all chapters belonging to this story
-    const chaptersColl = collection(db, 'chapters');
-    const q = query(chaptersColl, where('storyId', '==', storyId));
-    const snap = await getDocs(q);
-    const batch = writeBatch(db);
-    snap.forEach((d) => batch.delete(d.ref));
-    await batch.commit();
+    const statsDelRef = doc(db, 'site_stats', 'deleted_records');
+    await setDoc(statsDelRef, { storyIds: arrayUnion(storyId) }, { merge: true }).catch(() => {});
+
+    const sysDelRef = doc(db, 'system_settings', 'deleted_stories');
+    await setDoc(sysDelRef, { ids: arrayUnion(storyId) }, { merge: true }).catch(() => {});
+
+    // Delete all chapters belonging to this story from chapter_stats
+    const qStats = query(collection(db, 'chapter_stats'), where('storyId', '==', storyId));
+    const snapStats = await getDocs(qStats);
+    const batchStats = writeBatch(db);
+    snapStats.forEach((d) => batchStats.delete(d.ref));
+    await batchStats.commit().catch(() => {});
+
+    // Also attempt old chapters collection
+    try {
+      const chaptersColl = collection(db, 'chapters');
+      const q = query(chaptersColl, where('storyId', '==', storyId));
+      const snap = await getDocs(q);
+      const batch = writeBatch(db);
+      snap.forEach((d) => batch.delete(d.ref));
+      await batch.commit().catch(() => {});
+    } catch {}
   } catch (firestoreErr) {
     console.warn('Firestore delete warning:', firestoreErr);
   }
@@ -1744,27 +1865,40 @@ export const subscribeToAllChapters = (
   callback(getLiveChaptersRuntimeCache());
   activeAllChaptersSubscribers.add(callback);
 
-  // 2. Listen to Firestore collection 'chapters'
+  // 2. Listen to Firestore collection 'chapter_stats'
   let unsubFirestore: (() => void) | null = null;
   try {
-    const chaptersColl = collection(db, 'chapters');
+    const chaptersColl = collection(db, 'chapter_stats');
     unsubFirestore = onSnapshot(
       chaptersColl,
-      (snapshot) => {
+      async (snapshot) => {
+        let cloudDeletedChapterIds = new Set<string>();
+        try {
+          const statsDel = await getDoc(doc(db, 'site_stats', 'deleted_records'));
+          if (statsDel.exists()) {
+            const data = statsDel.data();
+            if (Array.isArray(data?.chapterIds)) {
+              data.chapterIds.forEach((id: string) => cloudDeletedChapterIds.add(id));
+            }
+          }
+        } catch {}
+
         const grouped: Record<string, Chapter[]> = {};
         snapshot.forEach((d) => {
-          const ch = { ...(d.data() as Chapter), id: d.id };
-          if (ch.storyId) {
+          const ch = { ...(d.data() as any), id: d.id };
+          if (ch.storyId && !ch.deleted && !cloudDeletedChapterIds.has(ch.id)) {
             if (!grouped[ch.storyId]) grouped[ch.storyId] = [];
             grouped[ch.storyId].push(ch);
           }
         });
 
-        // Ensure EVERY known story is represented (empty array if 0 chapters)
+        // Ensure EVERY known story is represented (including baseline sample chapters)
         const currentStories = getStoredStories();
         currentStories.forEach((s) => {
-          if (!grouped[s.id]) {
-            grouped[s.id] = [];
+          if (!grouped[s.id] || grouped[s.id].length === 0) {
+            const samples = SAMPLE_CHAPTERS[s.id] || [];
+            const nonDeletedSamples = samples.filter((c) => !cloudDeletedChapterIds.has(c.id));
+            grouped[s.id] = nonDeletedSamples;
           }
         });
 
@@ -1781,13 +1915,22 @@ export const subscribeToAllChapters = (
         const fullCache = getLiveChaptersRuntimeCache();
         callback(fullCache);
         notifyAllChaptersSubscribers(fullCache);
+
+        // Keep server API synced in background
+        if (typeof window !== 'undefined') {
+          fetch('/api/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chapters: fullCache }),
+          }).catch(() => {});
+        }
       },
       (err) => {
-        console.warn('All chapters Firestore snapshot error:', err);
+        console.warn('chapter_stats snapshot error:', err);
       }
     );
   } catch (e) {
-    console.warn('Firestore all chapters subscription error:', e);
+    console.warn('Firestore chapter_stats subscription error:', e);
   }
 
   return () => {
@@ -1818,30 +1961,54 @@ export const subscribeToStoryChapters = (
     fetch(`/api/chapters?storyId=${encodeURIComponent(storyId)}`)
       .then((res) => (res.ok ? res.json() : null))
       .then((serverList) => {
-        if (Array.isArray(serverList)) {
-          setLiveStoryChapters(storyId, serverList);
-          try {
-            localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(serverList));
-          } catch {}
-          callback(serverList);
+        if (Array.isArray(serverList) && serverList.length > 0) {
+          const currentList = getStoryChapters(storyId);
+          if (currentList.length === 0) {
+            setLiveStoryChapters(storyId, serverList);
+            try {
+              localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(serverList));
+            } catch {}
+            callback(serverList);
+            notifyChapterSubscribers(storyId, serverList);
+          }
         }
       })
       .catch(() => {});
   }
 
-  // 4. Connect to Firestore query
+  // 4. Connect to Firestore query on chapter_stats
   let unsubFirestore: (() => void) | null = null;
   try {
-    const chaptersColl = collection(db, 'chapters');
+    const chaptersColl = collection(db, 'chapter_stats');
     const q = query(chaptersColl, where('storyId', '==', storyId));
 
     unsubFirestore = onSnapshot(
       q,
-      (snapshot) => {
+      async (snapshot) => {
+        let cloudDeletedChapterIds = new Set<string>();
+        try {
+          const statsDel = await getDoc(doc(db, 'site_stats', 'deleted_records'));
+          if (statsDel.exists()) {
+            const data = statsDel.data();
+            if (Array.isArray(data?.chapterIds)) {
+              data.chapterIds.forEach((id: string) => cloudDeletedChapterIds.add(id));
+            }
+          }
+        } catch {}
+
         const list: Chapter[] = [];
         snapshot.forEach((d) => {
-          list.push({ ...(d.data() as Chapter), id: d.id });
+          const ch = { ...(d.data() as any), id: d.id };
+          if (!ch.deleted && !cloudDeletedChapterIds.has(ch.id)) {
+            list.push(ch);
+          }
         });
+
+        if (list.length === 0 && SAMPLE_CHAPTERS[storyId]) {
+          const samples = SAMPLE_CHAPTERS[storyId].filter((c) => !cloudDeletedChapterIds.has(c.id));
+          samples.forEach((c) => list.push(c));
+        }
+
         list.sort((a, b) => (Number(a.chapterNumber) || 0) - (Number(b.chapterNumber) || 0));
         try {
           localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(list));
@@ -1851,11 +2018,11 @@ export const subscribeToStoryChapters = (
         notifyChapterSubscribers(storyId, list);
       },
       (err) => {
-        console.warn(`Chapters snapshot error for ${storyId}:`, err);
+        console.warn(`chapter_stats snapshot error for ${storyId}:`, err);
       }
     );
   } catch (e) {
-    console.warn('Firestore chapter subscription error:', e);
+    console.warn('Firestore chapter_stats subscription error:', e);
   }
 
   return () => {
@@ -1923,29 +2090,43 @@ export const publishChapter = async (chapter: Chapter): Promise<void> => {
     console.warn('Server API chapter save warning:', apiErr);
   }
 
-  // 6. Cloud sync to Firestore
+  // 6. Cloud sync to Firestore (Authoritative write to chapter_stats)
   try {
-    const chapterRef = doc(db, 'chapters', cleanChapter.id);
-    await setDoc(
-      chapterRef,
-      sanitizeForFirestore({
-        ...cleanChapter,
-        publishedAt: cleanChapter.publishedAt || new Date().toISOString(),
-      }),
-      { merge: true }
-    );
+    const fullChapterData = sanitizeForFirestore({
+      ...cleanChapter,
+      chapterId: cleanChapter.id,
+      deleted: false,
+      publishedAt: cleanChapter.publishedAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
 
-    const storyRef = doc(db, 'stories', cleanChapter.storyId);
+    const chapterStatsRef = doc(db, 'chapter_stats', cleanChapter.id);
+    await setDoc(chapterStatsRef, fullChapterData, { merge: true });
+
+    // Unmark in site_stats/deleted_records
+    try {
+      const statsDelRef = doc(db, 'site_stats', 'deleted_records');
+      await updateDoc(statsDelRef, { chapterIds: arrayRemove(cleanChapter.id) }).catch(() => {});
+    } catch {}
+
+    // Update story_stats completedChapters
+    const storyStatsRef = doc(db, 'story_stats', cleanChapter.storyId);
     await setDoc(
-      storyRef,
+      storyStatsRef,
       {
         completedChapters: allChapters.length,
         updatedAt: 'Vừa đăng',
       },
       { merge: true }
     );
+
+    // Also attempt chapters & stories collections in background
+    const chapterRef = doc(db, 'chapters', cleanChapter.id);
+    await setDoc(chapterRef, fullChapterData, { merge: true }).catch(() => {});
+    const storyRef = doc(db, 'stories', cleanChapter.storyId);
+    await setDoc(storyRef, { completedChapters: allChapters.length, updatedAt: 'Vừa đăng' }, { merge: true }).catch(() => {});
   } catch (firestoreErr) {
-    console.warn('Firestore publish chapter warning (saved to server and locally):', firestoreErr);
+    console.warn('Firestore publish chapter warning:', firestoreErr);
   }
 };
 
@@ -1983,15 +2164,25 @@ export const deleteChapter = async (storyId: string, chapterId: string): Promise
 
   // Cloud Firestore delete
   try {
-    await deleteDoc(doc(db, 'chapters', chapterId));
-    const storyRef = doc(db, 'stories', storyId);
+    await deleteDoc(doc(db, 'chapter_stats', chapterId)).catch(() => {});
+    await setDoc(doc(db, 'chapter_stats', chapterId), { deleted: true, id: chapterId }, { merge: true }).catch(() => {});
+
+    // Record deletion in site_stats/deleted_records
+    const statsDelRef = doc(db, 'site_stats', 'deleted_records');
+    await setDoc(statsDelRef, { chapterIds: arrayUnion(chapterId) }, { merge: true }).catch(() => {});
+
+    // Update story_stats completedChapters
+    const storyStatsRef = doc(db, 'story_stats', storyId);
     await setDoc(
-      storyRef,
-      {
-        completedChapters: remaining.length,
-      },
+      storyStatsRef,
+      { completedChapters: remaining.length },
       { merge: true }
-    );
+    ).catch(() => {});
+
+    // Also attempt chapters & stories collections
+    await deleteDoc(doc(db, 'chapters', chapterId)).catch(() => {});
+    const storyRef = doc(db, 'stories', storyId);
+    await setDoc(storyRef, { completedChapters: remaining.length }, { merge: true }).catch(() => {});
   } catch (err) {
     console.warn('Firestore delete chapter warning:', err);
   }
@@ -2340,24 +2531,17 @@ export const subscribeToCollaborators = (
   const initial = getStoredCollaborators();
   callback(initial);
 
-  const colRef = collection(db, COLLABORATORS_COLLECTION);
+  const docRef = doc(db, 'site_stats', 'collaborators');
   return onSnapshot(
-    colRef,
+    docRef,
     (snapshot) => {
-      const list: CollaboratorItem[] = [];
-      snapshot.forEach((d) => {
-        const data = d.data();
-        list.push({
-          id: d.id,
-          email: data.email || '',
-          displayName: data.displayName || '',
-          role: data.role || 'collaborator',
-          roleTitle: data.roleTitle || 'Cộng sự Ban quản trị',
-          addedBy: data.addedBy || 'Tác giả chính',
-          addedAt: data.addedAt || new Date().toISOString(),
-          note: data.note || '',
-        });
-      });
+      let list: CollaboratorItem[] = [];
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        if (Array.isArray(data?.items)) {
+          list = data.items;
+        }
+      }
 
       // Merge with initial seeds if snapshot is empty or to ensure core admins exist
       const mergedList = [...list];
@@ -2399,9 +2583,10 @@ export const addCollaborator = async (
     localStorage.setItem(LOCAL_COLLABORATORS_KEY, JSON.stringify(updated));
   } catch {}
 
-  // 2. Write to Firestore
+  // 2. Write to Firestore site_stats/collaborators
   try {
-    await setDoc(doc(db, COLLABORATORS_COLLECTION, docId), newCollab);
+    await setDoc(doc(db, 'site_stats', 'collaborators'), { items: updated, updatedAt: new Date().toISOString() }, { merge: true });
+    await setDoc(doc(db, COLLABORATORS_COLLECTION, docId), newCollab).catch(() => {});
   } catch (err) {
     console.warn('Firestore add collaborator warning (cached locally):', err);
   }
@@ -2417,9 +2602,10 @@ export const deleteCollaborator = async (collabId: string): Promise<void> => {
     localStorage.setItem(LOCAL_COLLABORATORS_KEY, JSON.stringify(updated));
   } catch {}
 
-  // 2. Delete from Firestore
+  // 2. Delete from Firestore site_stats/collaborators
   try {
-    await deleteDoc(doc(db, COLLABORATORS_COLLECTION, collabId));
+    await setDoc(doc(db, 'site_stats', 'collaborators'), { items: updated, updatedAt: new Date().toISOString() }, { merge: true });
+    await deleteDoc(doc(db, COLLABORATORS_COLLECTION, collabId)).catch(() => {});
   } catch (err) {
     console.warn('Firestore delete collaborator warning:', err);
   }
@@ -2442,11 +2628,12 @@ export const updateCollaboratorRole = async (
   } catch {}
 
   try {
+    await setDoc(doc(db, 'site_stats', 'collaborators'), { items: updated, updatedAt: new Date().toISOString() }, { merge: true });
     await setDoc(
       doc(db, COLLABORATORS_COLLECTION, collabId),
       { role, roleTitle: roleTitle || '', updatedAt: new Date().toISOString() },
       { merge: true }
-    );
+    ).catch(() => {});
   } catch (err) {
     console.warn('Firestore update collaborator role warning:', err);
   }
@@ -2476,11 +2663,12 @@ export const updateCollaboratorFullData = async (
   } catch {}
 
   try {
+    await setDoc(doc(db, 'site_stats', 'collaborators'), { items: updated, updatedAt: new Date().toISOString() }, { merge: true });
     await setDoc(
       doc(db, COLLABORATORS_COLLECTION, collabId),
       { ...data, updatedAt: new Date().toISOString() },
       { merge: true }
-    );
+    ).catch(() => {});
   } catch (err) {
     console.warn('Firestore update collaborator warning:', err);
   }

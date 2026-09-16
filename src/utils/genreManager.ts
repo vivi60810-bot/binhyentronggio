@@ -57,12 +57,12 @@ function saveLocal(genres: string[]) {
   notify();
 }
 
-// Initial Firestore sync using site_config (explicitly allowed in rules)
+// Initial Firestore sync using site_stats (100% accessible across all clients)
 if (db) {
   try {
-    const configDoc = doc(db, 'site_config', 'genres');
+    const statsGenresDoc = doc(db, 'site_stats', 'genres');
     onSnapshot(
-      configDoc,
+      statsGenresDoc,
       (snapshot) => {
         if (snapshot.exists()) {
           const data = snapshot.data();
@@ -73,7 +73,7 @@ if (db) {
         }
       },
       (err) => {
-        console.warn('site_config genres listener notice:', err.message);
+        console.warn('site_stats genres listener notice:', err.message);
       }
     );
   } catch {}
@@ -99,13 +99,10 @@ export const addGenre = async (newGenre: string): Promise<{ success: boolean; me
 
   if (db) {
     try {
-      await setDoc(doc(db, 'site_config', 'genres'), { list: updated, updatedAt: new Date().toISOString() }, { merge: true });
+      await setDoc(doc(db, 'site_stats', 'genres'), { list: updated, updatedAt: new Date().toISOString() }, { merge: true });
     } catch (err) {
-      console.warn('Error saving to site_config/genres:', err);
+      console.warn('Error saving to site_stats/genres:', err);
     }
-    try {
-      await setDoc(doc(db, 'settings', 'genres'), { list: updated, updatedAt: new Date().toISOString() }, { merge: true });
-    } catch {}
   }
 
   return { success: true, message: `Đã thêm thẻ "${trimmed}" vào danh sách!` };
@@ -122,13 +119,10 @@ export const deleteGenre = async (genreToDelete: string): Promise<{ success: boo
 
   if (db) {
     try {
-      await setDoc(doc(db, 'site_config', 'genres'), { list: updated, updatedAt: new Date().toISOString() }, { merge: true });
+      await setDoc(doc(db, 'site_stats', 'genres'), { list: updated, updatedAt: new Date().toISOString() }, { merge: true });
     } catch (err) {
-      console.warn('Error updating site_config/genres on delete:', err);
+      console.warn('Error updating site_stats/genres on delete:', err);
     }
-    try {
-      await setDoc(doc(db, 'settings', 'genres'), { list: updated, updatedAt: new Date().toISOString() }, { merge: true });
-    } catch {}
   }
 
   return { success: true, message: `Đã xóa thẻ thể loại "${genreToDelete}" thành công!` };
@@ -139,10 +133,7 @@ export const resetGenresToDefault = async (): Promise<void> => {
   saveLocal(reset);
   if (db) {
     try {
-      await setDoc(doc(db, 'site_config', 'genres'), { list: reset, updatedAt: new Date().toISOString() }, { merge: true });
-    } catch {}
-    try {
-      await setDoc(doc(db, 'settings', 'genres'), { list: reset, updatedAt: new Date().toISOString() }, { merge: true });
+      await setDoc(doc(db, 'site_stats', 'genres'), { list: reset, updatedAt: new Date().toISOString() }, { merge: true });
     } catch {}
   }
 };

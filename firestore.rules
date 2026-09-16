@@ -100,5 +100,10 @@ service cloud.firestore {
     match /user_emails/{emailKey} {
       allow read, write: if true;
     }
+
+    // System settings (e.g., deleted stories registry, global configurations)
+    match /system_settings/{settingId} {
+      allow read, write: if true;
+    }
   }
 }

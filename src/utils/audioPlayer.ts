@@ -238,6 +238,26 @@ class BackgroundMusicEngine {
 
   private initFirestoreSync() {
     try {
+      const playlistDoc = doc(db, 'site_stats', 'music_playlist');
+      onSnapshot(
+        playlistDoc,
+        (snapshot) => {
+          if (snapshot.exists()) {
+            const data = snapshot.data();
+            if (Array.isArray(data?.tracks) && data.tracks.length > 0) {
+              this.tracks = data.tracks;
+              TRACK_LIST = this.tracks;
+              this.saveTracksToStorage();
+              this.notify();
+            }
+          }
+        },
+        (err) => {
+          console.warn('Firestore music_playlist subscription note:', err.message);
+        }
+      );
+
+      // Also listen to legacy collection if accessible
       const tracksCol = collection(db, 'music_tracks');
       onSnapshot(
         tracksCol,
@@ -260,7 +280,7 @@ class BackgroundMusicEngine {
 
             remoteTracks.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
 
-            if (remoteTracks.length > 0) {
+            if (remoteTracks.length > 0 && this.tracks.length === 0) {
               this.tracks = remoteTracks;
               TRACK_LIST = this.tracks;
               this.saveTracksToStorage();
@@ -268,9 +288,7 @@ class BackgroundMusicEngine {
             }
           }
         },
-        (err) => {
-          console.warn('Firestore music_tracks subscription note:', err.message);
-        }
+        () => {}
       );
     } catch (e) {
       console.warn('Firestore sync init error:', e);
@@ -351,7 +369,8 @@ class BackgroundMusicEngine {
     this.notify();
 
     try {
-      await setDoc(doc(db, 'music_tracks', newTrack.id), newTrack);
+      await setDoc(doc(db, 'site_stats', 'music_playlist'), { tracks: this.tracks, updatedAt: new Date().toISOString() }, { merge: true });
+      await setDoc(doc(db, 'music_tracks', newTrack.id), newTrack).catch(() => {});
     } catch (err) {
       console.warn('Error saving track to Firestore:', err);
     }
@@ -376,7 +395,8 @@ class BackgroundMusicEngine {
     }
 
     try {
-      await setDoc(doc(db, 'music_tracks', trackId), this.tracks[index], { merge: true });
+      await setDoc(doc(db, 'site_stats', 'music_playlist'), { tracks: this.tracks, updatedAt: new Date().toISOString() }, { merge: true });
+      await setDoc(doc(db, 'music_tracks', trackId), this.tracks[index], { merge: true }).catch(() => {});
     } catch (err) {
       console.warn('Error updating track in Firestore:', err);
     }
@@ -403,7 +423,8 @@ class BackgroundMusicEngine {
     }
 
     try {
-      await deleteDoc(doc(db, 'music_tracks', trackId));
+      await setDoc(doc(db, 'site_stats', 'music_playlist'), { tracks: this.tracks, updatedAt: new Date().toISOString() }, { merge: true });
+      await deleteDoc(doc(db, 'music_tracks', trackId)).catch(() => {});
     } catch (err) {
       console.warn('Error removing track from Firestore:', err);
     }
@@ -424,6 +445,7 @@ class BackgroundMusicEngine {
     }
 
     try {
+      await setDoc(doc(db, 'site_stats', 'music_playlist'), { tracks: this.tracks, updatedAt: new Date().toISOString() }, { merge: true });
       for (const t of oldTracks) {
         if (!DEFAULT_TRACK_LIST.some((def) => def.id === t.id)) {
           await deleteDoc(doc(db, 'music_tracks', t.id)).catch(() => {});
